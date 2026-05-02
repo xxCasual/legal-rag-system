@@ -34,7 +34,7 @@ class RAGSystem(ABC):
 
 
 # ============================================================
-# 策略 1: Baseline - 路由 + 向量检索 + RAG-Fusion + CRAG
+# 策略 1: Baseline
 # ============================================================
 
 class BaselineRAG(RAGSystem):
@@ -57,21 +57,17 @@ class BaselineRAG(RAGSystem):
 
 
 # ============================================================
-# 策略 2: Hybrid - 路由 + (BM25+向量+RRF) + RAG-Fusion + CRAG
+# 策略 2: Hybrid (BM25 + 向量 + RRF)
 # ============================================================
 
 class HybridRAG(RAGSystem):
-    """
-    在 Baseline 基础上把检索器从纯向量替换为 BM25+向量+RRF。
-    其他模块完全一致，能精确隔离"hybrid 检索"对评估指标的影响。
-    """
     name = "hybrid"
 
     def __init__(self):
         from src.hybrid_main import HybridLegalRAGPipeline
         self.pipeline = HybridLegalRAGPipeline(
             data_dir=str(ROOT / "data"),
-            persist_dir=str(ROOT / "chroma_db"),  # 复用同一向量库
+            persist_dir=str(ROOT / "chroma_db"),
             verbose=False,
             rebuild_index=False,
         )
@@ -84,17 +80,27 @@ class HybridRAG(RAGSystem):
 
 
 # ============================================================
-# 策略 3: Hybrid + Reranker（待实施）
+# 策略 3: Hybrid + Reranker
 # ============================================================
 
 class HybridRerankRAG(RAGSystem):
+    """Hybrid 检索 + BGE-reranker-base 重排序。"""
     name = "hybrid_rerank"
 
     def __init__(self):
-        raise NotImplementedError("等下一步实施 reranker 后填充")
+        from src.hybrid_rerank_main import HybridRerankLegalRAGPipeline
+        self.pipeline = HybridRerankLegalRAGPipeline(
+            data_dir=str(ROOT / "data"),
+            persist_dir=str(ROOT / "chroma_db"),
+            verbose=False,
+            rebuild_index=False,
+        )
 
     def query(self, question: str) -> Tuple[str, List[str]]:
-        raise NotImplementedError
+        answer, contexts = self.pipeline.query(question)
+        if not contexts:
+            contexts = [""]
+        return answer, contexts
 
 
 # ============================================================
