@@ -20,7 +20,7 @@
 - Context Precision：0.613 → 0.777（**+26.7%**）
 - Context Recall：0.684 → 0.889（**+30.0%**）
 
-测试集：50 个问题（RAGAS TestsetGenerator 生成 + 人工质检）｜评估器：DeepSeek-V3 + BGE 中文 embedding
+测试集：50 个问题（RAGAS TestsetGenerator 生成 + 人工质检）｜评估器：DeepSeek-V4 + BGE 中文 embedding
 
 ---
 
