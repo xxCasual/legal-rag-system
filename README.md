@@ -2,6 +2,8 @@
 
 > 基于 4 部中国劳动法律的 RAG 系统，融合 **路由 + Hybrid 检索 + Reranker + CRAG 质检**，使用 **RAGAS** 框架进行五阶段量化评估，整体性能相对 baseline **提升 25.8%**。
 
+当前代码已经整理为 **v5-first 企业 RAG 基座**：生产主路径使用 `Hybrid Search + BGE-reranker-v2-m3 + 可配置 CRAG + 法律 Prompt`。baseline、hybrid 等旧版本保留为实验记录和 RAGAS 对比证据，不再作为后续企业 Agent 平台的运行入口。
+
 ## 评估结果
 
 ![五阶段演进对比](data/eval/results/comparison_20260502_164743.png)
@@ -56,7 +58,7 @@
 └──────────────────────────┘
             ↓
 ┌──────────────────────────┐
-│ CRAG 质检                 │  LLM 逐 chunk 判断相关性，过滤无关内容
+│ CRAG 质检                 │  可选 LLM 质检 / 本地 reranker / 关闭
 └──────────────────────────┘
             ↓
 ┌──────────────────────────┐
@@ -73,7 +75,7 @@
 | **路由器** | DeepSeek-V3 分类 | 不同问题类型走不同检索策略，节省成本同时提升精度 |
 | **Hybrid 检索** | BM25 (单字+数字+英文分词) + 向量 (BGE-small-zh) + RRF 融合 (k=60) | 法律领域条号、专业术语用 BM25 精确匹配；语义相似用向量检索 |
 | **Reranker** | BAAI/bge-reranker-v2-m3 (cross-encoder) | 在 16 个候选中精排出 top-4，比 embedding 余弦相似度精度高 |
-| **CRAG 质检** | LLM 逐 chunk yes/no 判断 | 过滤检索器返回但实际无关的 chunk，降低噪声干扰生成端 |
+| **CRAG 质检** | `LEGAL_RAG_CRAG_MODE=llm\|reranker\|off` | `reranker` 模式跳过逐 chunk LLM 判断，直接信任本地精排结果，降低 Agent 评估和线上问答延迟；`llm` 可用于复现历史 v5 行为 |
 | **法律 Prompt** | 强约束模板 + 知识库外检测 | 抑制幻觉，宁可拒答不可编造 |
 
 ---
@@ -146,10 +148,16 @@ legal-rag-system/
 ├── requirements.txt
 ├── .gitignore
 │
-├── src/                       # 三个版本的 RAG pipeline
-│   ├── main.py                # v1: Baseline (向量检索)
-│   ├── hybrid_main.py         # v3: + Hybrid 检索
-│   └── hybrid_rerank_main.py  # v5: + Reranker 重排序 (最终版)
+├── app/                       # 企业 RAG 平台主目录
+│   ├── core/
+│   │   └── config.py          # 统一路径、模型和环境变量配置
+│   └── rag/
+│       └── hybrid_rerank.py   # v5 生产级 RAG 基座
+│
+├── src/                       # 兼容入口 + 历史实验版本
+│   ├── main.py                # legacy/evaluation-only: v1 Baseline
+│   ├── hybrid_main.py         # legacy/evaluation-only: v3 Hybrid
+│   └── hybrid_rerank_main.py  # 兼容入口，调用 app/rag 的 v5 实现
 │
 ├── evaluation/                # RAGAS 评估套件
 │   ├── config.py              # 模型、路径配置
@@ -181,6 +189,8 @@ legal-rag-system/
 ```bash
 git clone https://github.com/xxCasual/legal-rag-system.git
 cd legal-rag-system
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -192,19 +202,118 @@ echo "DEEPSEEK_API_KEY=sk-xxx" > .env
 
 DeepSeek API Key 申请地址：[https://platform.deepseek.com](https://platform.deepseek.com)
 
+默认 `LEGAL_RAG_CRAG_MODE=reranker`，法律问答会用本地 reranker 结果替代逐 chunk LLM yes/no 质检，以减少远程调用。可选值：
+
+```bash
+# 复现历史 v5 行为：每个 chunk 调 LLM 判断相关性
+LEGAL_RAG_CRAG_MODE=llm
+
+# 当前推荐：信任本地 reranker 精排结果
+LEGAL_RAG_CRAG_MODE=reranker
+
+# 完全跳过 CRAG 阶段
+LEGAL_RAG_CRAG_MODE=off
+```
+
 ### 3. 跑 Demo
 
 ```bash
-# 运行最终版本（v5 hybrid + reranker）
+# 运行生产基座（v5 hybrid + reranker）
 python src/hybrid_rerank_main.py
 
-# 也可以试 baseline 对比
+# 新代码建议直接导入 app.rag
+python -c "from app.rag import HybridRerankLegalRAGPipeline; print(HybridRerankLegalRAGPipeline.__name__)"
+
+# legacy/evaluation-only: 如需复现实验过程，也可以试 baseline 对比
 python src/main.py
 ```
 
 首次运行会自动下载 BGE embedding 模型（~100MB）和 reranker 模型（~600MB）。
 
-### 4. 跑评估（可选）
+### 4. 启动 API 服务
+
+```bash
+uvicorn app.main:app --reload
+```
+
+健康检查不会加载 RAG 模型：
+
+```bash
+curl http://127.0.0.1:8000/api/health
+```
+
+聊天接口默认经过 LangGraph Agent。法律问题会调用法律检索工具，企业制度问题会调用制度文档检索工具：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query":"试用期最长多久？"}'
+```
+
+返回字段包括 `answer`、`citations`、`route`、`intent`、`tools_used` 和 `latency`。
+
+### 5. 上传企业制度文档
+
+上传文件会进入独立的企业文档库，不会改动原有法律知识库与 RAGAS 评估数据。当前支持 `txt`、`md`、`pdf`、`docx`：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/documents/upload \
+  -F "file=@员工手册.pdf"
+```
+
+查看已上传文档：
+
+```bash
+curl http://127.0.0.1:8000/api/documents
+```
+
+企业文档原文件保存在 `storage/uploads/`，文档 registry 保存在 `storage/documents.json`，企业文档向量索引保存在 `chroma_company_docs/`。这些目录均已加入 `.gitignore`。
+
+上传制度文档后，可以直接问 Agent：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query":"公司的工资发放日是什么时候？"}'
+```
+
+### 6. 劳动合同风险审查
+
+合同审查接口接收劳动合同全文，围绕试用期、合同期限、工资、工时、社保、解除、竞业限制七类条款进行结构化风险提示。该能力会调用现有法律 RAG 检索法律依据，但不会改动原有法律知识库、Agent chat 或 RAGAS 评估逻辑。
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/review/contract \
+  -H "Content-Type: application/json" \
+  -d '{"contract_text":"合同期限为三年。试用期一年。员工自愿放弃社保。"}'
+```
+
+返回字段包括 `risk_level`、`findings`、`evidence`、`suggestions`、`disclaimer` 和 `latency`。其中 `disclaimer` 固定为 `仅供参考，需人工复核`；系统只给风险提示，不输出确定性法律结论。
+
+当合同审查结果为 `high` 时，接口不会直接返回完整审查结果，而是返回 `review_status=pending_review` 和 `review_id`，等待人工审批。
+
+### 7. 人工审批
+
+高风险输出会写入本地审批队列 `storage/pending_reviews.json`。审批通过后才返回完整结果；拒绝后不输出最终答案。
+
+查看待审批列表：
+
+```bash
+curl http://127.0.0.1:8000/api/reviews/pending
+```
+
+审批通过：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/reviews/{review_id}/approve
+```
+
+审批拒绝：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/reviews/{review_id}/reject
+```
+
+### 8. 跑评估（可选）
 
 ```bash
 # 生成测试集（一次性，~10 分钟，DeepSeek 费用约 ¥1-3）
@@ -219,6 +328,27 @@ python evaluation/analyze_results.py
 # 生成多版本对比图
 python evaluation/visualize_results.py
 ```
+
+Agent 工作流评估独立于 RAGAS，使用 `data/eval/agent_testset.json`，结果保存到 `data/eval/agent_results/`，不会混入 RAGAS 的 `data/eval/results/`：
+
+```bash
+python evaluation/agent_eval.py --limit 5
+```
+
+默认情况下，合同审查样本只评估规则提取和风险分级，不检索法律依据，因此适合快速回归。若需要完整证据链评估，可以显式开启：
+
+```bash
+python evaluation/agent_eval.py --include-contract-evidence
+```
+
+Agent Eval 结果占位：
+
+| 指标 | 当前结果 |
+|---|---|
+| intent_accuracy | TBD |
+| tool_call_accuracy | TBD |
+| refusal_accuracy | TBD |
+| risk_accuracy | TBD |
 
 ---
 

@@ -3,6 +3,9 @@ src/main.py
 ============
 法律 RAG 系统：路由 + RAG-Fusion + CRAG + 法律专用 Prompt
 
+Legacy/evaluation-only baseline entrypoint. The enterprise platform production
+RAG base is v5 in app/rag/hybrid_rerank.py.
+
 两种使用方式：
 1. 直接跑 Demo（保留原行为）：
        python src/main.py
@@ -21,7 +24,7 @@ from typing import List, Tuple, Dict, Any
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser

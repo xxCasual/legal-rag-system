@@ -120,7 +120,10 @@ def evaluate_with_ragas(enriched_samples: List[Dict]) -> pd.DataFrame:
     metrics = [
         Faithfulness(llm=evaluator_llm),
         ResponseRelevancy(
-            llm=evaluator_llm, embeddings=evaluator_embeddings
+            llm=evaluator_llm,
+            embeddings=evaluator_embeddings,
+            # DeepSeek's OpenAI-compatible API currently only supports n=1.
+            strictness=1,
         ),
         LLMContextPrecisionWithReference(llm=evaluator_llm),
         LLMContextRecall(llm=evaluator_llm),

@@ -1,18 +1,18 @@
 """
-src/hybrid_main.py
-==================
-Hybrid 检索版法律 RAG。
+src/hybrid_rerank_main.py
+==========================
+Hybrid 检索 + Reranker 重排序版法律 RAG。
 
-Legacy/evaluation-only hybrid entrypoint. The enterprise platform production
-RAG base is v5 in app/rag/hybrid_rerank.py.
-
-与 src/main.py 唯一区别：把单一向量检索替换为 BM25+向量+RRF 融合。
-其他模块（路由器 / RAG-Fusion 多查询 / CRAG / 法律 Prompt）完全一致。
+与 hybrid_main.py 的唯一区别：
+- 把 retriever_k 从 4 调到 8（给 reranker 更多原料）
+- 在 _hybrid_retrieve / _hybrid_rag_fusion_retrieve 后追加 reranker 重排
+- 重排后取 top-N（默认 4）作为最终 contexts
 
 设计动机：
-- baseline 评估发现 30% 样本"漏召回"关键法条
-- BM25 对条号、专业术语精确匹配能力强，能补充向量检索盲区
-- RRF（Reciprocal Rank Fusion）将两种检索结果按排名融合，无需归一化分数
+- hybrid 评估发现 Context Precision 0.80（不错但仍有 10/48 样本 < 0.5）
+- 这部分样本是"召回对了但排序里夹杂无关 chunk"，正是 reranker 的甜蜜点
+- BGE-reranker-base 用 cross-encoder 直接判断 (query, doc) 相关性，
+  比 embedding 余弦相似度精度高得多
 """
 
 import os
@@ -20,6 +20,7 @@ import shutil
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 
+from app.core.config import settings
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -31,47 +32,59 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 
 
-class HybridLegalRAGPipeline:
-    """
-    Hybrid 检索版法律 RAG。
-    """
+VALID_CRAG_MODES = {"llm", "reranker", "off"}
+
+
+def normalize_crag_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized not in VALID_CRAG_MODES:
+        choices = ", ".join(sorted(VALID_CRAG_MODES))
+        raise ValueError(f"LEGAL_RAG_CRAG_MODE must be one of: {choices}")
+    return normalized
+
+
+class HybridRerankLegalRAGPipeline:
+    """Hybrid 检索 + BGE Reranker 重排序版法律 RAG。"""
 
     def __init__(
         self,
-        data_dir: str = "data",
-        persist_dir: str = "./chroma_db",
-        embedding_model: str = "BAAI/bge-small-zh-v1.5",
-        llm_model: str = "deepseek-chat",
-        retriever_k: int = 4,
-        bm25_k: int = 4,
-        vector_k: int = 4,
+        data_dir: str = str(settings.data_dir),
+        persist_dir: str = str(settings.chroma_persist_dir),
+        embedding_model: str = settings.embedding_model,
+        reranker_model: str = settings.reranker_model,
+        llm_model: str = settings.llm_model,
+        # 召回数：扩大到 8（hybrid 时是 4），给 reranker 更多原料
+        bm25_k: int = 8,
+        vector_k: int = 8,
+        # 重排后保留 top-N 作为最终 contexts
+        rerank_top_n: int = 4,
         rrf_k_const: int = 60,
+        crag_mode: str = settings.crag_mode,
         rebuild_index: bool = False,
         verbose: bool = True,
     ):
         """
         Args:
-            retriever_k: 最终融合后返回的 chunk 数
-            bm25_k: BM25 检索召回数（建议 ≥ retriever_k）
-            vector_k: 向量检索召回数（建议 ≥ retriever_k）
-            rrf_k_const: RRF 公式中的 k 常数，60 是论文推荐值
+            bm25_k / vector_k: 各自召回多少 chunk（融合前）
+            rerank_top_n: reranker 排序后保留多少 chunk（送进 CRAG）
+            reranker_model: HuggingFace 上的 reranker 模型名
+            crag_mode: llm=逐 chunk 调用 LLM 质检；reranker=信任本地 reranker 排序；
+                off=跳过 CRAG。
         """
         self.data_dir = Path(data_dir)
         self.persist_dir = persist_dir
-        self.retriever_k = retriever_k
         self.bm25_k = bm25_k
         self.vector_k = vector_k
+        self.rerank_top_n = rerank_top_n
         self.rrf_k_const = rrf_k_const
+        self.crag_mode = normalize_crag_mode(crag_mode)
         self.verbose = verbose
 
-        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        api_key = os.environ.get("DEEPSEEK_API_KEY") or settings.deepseek_api_key
         if not api_key:
-            raise ValueError(
-                "请设置 DEEPSEEK_API_KEY 环境变量。"
-                " export DEEPSEEK_API_KEY=sk-xxx 或在 .env 中配置。"
-            )
+            raise ValueError("请设置 DEEPSEEK_API_KEY 环境变量")
 
-        # ---- 加载文档（BM25 必须保留全部 chunks 在内存）----
+        # ---- 文档 + 切分 ----
         self._log(f"📚 加载文档: {self.data_dir}")
         loader = DirectoryLoader(
             str(self.data_dir), glob="*.txt",
@@ -85,7 +98,7 @@ class HybridLegalRAGPipeline:
         self.splits: List[Document] = splitter.split_documents(docs)
         self._log(f"   {len(docs)} 文档, {len(self.splits)} chunks")
 
-        # ---- 向量检索 ----
+        # ---- 向量索引 ----
         embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
         persist_path = Path(persist_dir)
         index_exists = persist_path.exists() and any(persist_path.iterdir())
@@ -107,75 +120,112 @@ class HybridLegalRAGPipeline:
             search_kwargs={"k": vector_k}
         )
 
-        # ---- BM25 检索 ----
-        # BM25Retriever.from_documents 内部会做分词。中文场景需要手工分词后传入
-        # 这里用一个简单的字符级 + 数字/英文保留的分词，对法律文本足够
+        # ---- BM25 ----
         self.bm25_retriever = self._build_bm25_retriever(self.splits, k=bm25_k)
-        self._log(f"✅ BM25 索引已构建")
+        self._log("✅ BM25 索引已构建")
+
+        # ---- Reranker（关键的新组件）----
+        self._log(f"📦 加载 reranker: {reranker_model}")
+        self.reranker = self._load_reranker(reranker_model)
+        self._log("✅ Reranker 已加载")
+        self._log(f"✅ CRAG 模式: {self.crag_mode}")
 
         # ---- LLM ----
         self.llm = ChatOpenAI(
             model=llm_model,
             api_key=api_key,
-            base_url="https://api.deepseek.com",
+            base_url=settings.deepseek_base_url,
         )
 
-        # ---- 各 chain ----
         self._build_chains()
 
     # ----------------------------------------------------------------
-    # 工具：日志
+    # Reranker 加载（用 sentence-transformers 的 CrossEncoder）
+    # ----------------------------------------------------------------
+
+    @staticmethod
+    def _load_reranker(model_name: str):
+        """
+        用 sentence-transformers 的 CrossEncoder 加载。
+        CrossEncoder 接受 [(q, d1), (q, d2), ...] 列表，输出每对的相关性分数。
+        """
+        import torch
+        from sentence_transformers import CrossEncoder
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        return CrossEncoder(model_name, device=device, max_length=512)
+
+    # ----------------------------------------------------------------
+    # 重排：Hybrid 候选 → Reranker 打分 → 按分数降序取 top_n
+    # ----------------------------------------------------------------
+
+    def _rerank(
+        self, query: str, candidates: List[Document], top_n: int
+    ) -> List[Document]:
+        """
+        对 candidates 做 reranker 重排，返回分数最高的 top_n 个。
+        """
+        if not candidates:
+            return []
+        if len(candidates) <= top_n:
+            # 候选数小于等于 top_n，但仍重排（保证顺序最优）
+            top_n = len(candidates)
+
+        # 构造 (query, doc) pairs
+        pairs = [(query, doc.page_content) for doc in candidates]
+        scores = self.reranker.predict(pairs, show_progress_bar=False)
+
+        # 按分数降序排序
+        indexed = list(zip(candidates, scores))
+        indexed.sort(key=lambda x: x[1], reverse=True)
+        for doc, score in indexed:
+            self._set_rerank_score(doc, score)
+
+        if self.verbose:
+            self._log("  🎯 Reranker 重排前后对比:")
+            for rank, (doc, score) in enumerate(indexed[:top_n], 1):
+                preview = doc.page_content[:50].replace("\n", " ")
+                self._log(f"     #{rank} score={score:.4f} | {preview}...")
+
+        return [doc for doc, _ in indexed[:top_n]]
+
+    @staticmethod
+    def _set_rerank_score(doc: Document, score: float) -> None:
+        try:
+            metadata = dict(doc.metadata or {})
+            metadata["rerank_score"] = float(score)
+            doc.metadata = metadata
+        except (AttributeError, TypeError, ValueError):
+            return
+
+    # ----------------------------------------------------------------
+    # 工具
     # ----------------------------------------------------------------
 
     def _log(self, msg: str):
         if self.verbose:
             print(msg)
 
-    # ----------------------------------------------------------------
-    # BM25：中文分词
-    # ----------------------------------------------------------------
-
     @staticmethod
     def _chinese_tokenize(text: str) -> List[str]:
-        """
-        极简中文分词：单字 + 连续数字/英文/法条编号保留。
-        对法律文本足够：
-        - "第二十一条" 会被切成 ['第','二','十','一','条']，BM25 仍能命中
-        - 想要更好的效果可以换 jieba：
-              import jieba
-              return list(jieba.cut(text))
-        """
         import re
-        # 把连续的数字/英文/特殊符号识别出来，其余按单字
         tokens = []
-        # 匹配：数字串 / 英文串 / 单个汉字 / 单个其他字符
         pattern = re.compile(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]|[^\s]")
         for m in pattern.finditer(text):
             tokens.append(m.group())
         return tokens
 
-    def _build_bm25_retriever(
-        self, documents: List[Document], k: int
-    ) -> BM25Retriever:
+    def _build_bm25_retriever(self, documents: List[Document], k: int):
         retriever = BM25Retriever.from_documents(
-            documents,
-            preprocess_func=self._chinese_tokenize,
+            documents, preprocess_func=self._chinese_tokenize,
         )
         retriever.k = k
         return retriever
-
-    # ----------------------------------------------------------------
-    # 检索：BM25 + 向量 + RRF 融合
-    # ----------------------------------------------------------------
 
     @staticmethod
     def _rrf_fuse(
         results_lists: List[List[Document]], k_const: int = 60
     ) -> List[Document]:
-        """
-        Reciprocal Rank Fusion。
-        每个文档的得分 = Σ 1/(k_const + rank_i)，rank 从 1 开始。
-        """
         scores: Dict[str, float] = {}
         doc_map: Dict[str, Document] = {}
         for result in results_lists:
@@ -188,19 +238,30 @@ class HybridLegalRAGPipeline:
         sorted_keys = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
         return [doc_map[k] for k in sorted_keys]
 
-    def _hybrid_retrieve(self, query: str) -> List[Document]:
-        """单次 hybrid 检索：BM25 + 向量 + RRF 融合"""
+    # ----------------------------------------------------------------
+    # 检索（hybrid + rerank）
+    # ----------------------------------------------------------------
+
+    def _hybrid_retrieve_then_rerank(self, query: str) -> List[Document]:
+        """
+        单 query 流程：
+        1. BM25 召回 bm25_k 个 + 向量召回 vector_k 个
+        2. RRF 融合（去重）
+        3. Reranker 重排，取 top rerank_top_n
+        """
         bm25_docs = self.bm25_retriever.invoke(query)
         vector_docs = self.vector_retriever.invoke(query)
         fused = self._rrf_fuse([bm25_docs, vector_docs], k_const=self.rrf_k_const)
-        return fused[: self.retriever_k]
+        # fused 此时可能有 8-16 个候选（去重后），交给 reranker 选 top_n
+        return self._rerank(query, fused, self.rerank_top_n)
 
-    def _hybrid_rag_fusion_retrieve(self, question: str) -> List[Document]:
+    def _hybrid_rag_fusion_then_rerank(self, question: str) -> List[Document]:
         """
-        多查询 + Hybrid + RRF：
-        1. 用 LLM 把原 query 改写成 3 个查询
-        2. 每个查询都做 BM25+向量 hybrid 检索
-        3. 把所有 hybrid 结果再用一次 RRF 融合
+        多 query 流程：
+        1. 用 LLM 生成 3 个 query 改写
+        2. 每个 query 各自做 hybrid 召回
+        3. 全部结果再 RRF 融合
+        4. Reranker 重排，取 top rerank_top_n
         """
         queries = self.generate_queries.invoke({"question": question})
         self._log("  📝 RAG-Fusion 改写：")
@@ -208,24 +269,29 @@ class HybridLegalRAGPipeline:
             self._log(f"     Q{i + 1}: {q}")
 
         all_queries = [question] + queries
-        # 每个 query 做一次 hybrid
-        per_query_results = [self._hybrid_retrieve(q) for q in all_queries]
-        # 再 RRF 一次
-        fused = self._rrf_fuse(per_query_results, k_const=self.rrf_k_const)
-        return fused
+        per_query_results = []
+        for q in all_queries:
+            bm25_docs = self.bm25_retriever.invoke(q)
+            vector_docs = self.vector_retriever.invoke(q)
+            fused_q = self._rrf_fuse([bm25_docs, vector_docs], k_const=self.rrf_k_const)
+            per_query_results.append(fused_q[: max(self.bm25_k, self.vector_k)])
+
+        # 跨 query 再融合
+        all_fused = self._rrf_fuse(per_query_results, k_const=self.rrf_k_const)
+
+        # Reranker 重排（用原始 question，不是改写后的）
+        return self._rerank(question, all_fused, self.rerank_top_n)
 
     # ----------------------------------------------------------------
-    # Chains（与 main.py 一致）
+    # Chains
     # ----------------------------------------------------------------
 
     def _build_chains(self):
-        # 路由器（用 main.py 改进过的版本）
         router_prompt = ChatPromptTemplate.from_template(
             """你是一个法律问题分类器。本系统的知识库包含 4 部中国法律：
 《劳动法》、《劳动合同法》、《劳动争议调解仲裁法》、《保险法》。
 
 请判断用户问题属于以下哪个类型，只回答类型名称：
-
 - "法条查询"：询问具体的法律条文规定
 - "法律咨询"：描述具体情境寻求建议
 - "知识库外"：与上述 4 部法律完全无关（如天气、编程、医疗、刑事案件）
@@ -242,7 +308,6 @@ class HybridLegalRAGPipeline:
             router_prompt | self.llm | StrOutputParser() | (lambda x: x.strip())
         )
 
-        # 多查询改写
         multi_query_prompt = ChatPromptTemplate.from_template(
             """你是一个法律检索助手。请把用户的法律问题改写成3个不同角度的版本，
 用于在法律法规数据库中检索。每个版本一行，不要编号，不要额外说明。
@@ -253,15 +318,15 @@ class HybridLegalRAGPipeline:
             | (lambda x: [q.strip() for q in x.strip().split("\n") if q.strip()])
         )
 
-        # CRAG
-        grader_prompt = ChatPromptTemplate.from_template(
-            """判断以下法律条文是否与用户问题相关。只回答"yes"或"no"。
+        self.grade_chain = None
+        if self.crag_mode == "llm":
+            grader_prompt = ChatPromptTemplate.from_template(
+                """判断以下法律条文是否与用户问题相关。只回答"yes"或"no"。
 法律条文：{document}
 用户问题：{question}"""
-        )
-        self.grade_chain = grader_prompt | self.llm | StrOutputParser()
+            )
+            self.grade_chain = grader_prompt | self.llm | StrOutputParser()
 
-        # 法律生成
         legal_prompt = ChatPromptTemplate.from_template(
             """你是一个专业的中国法律顾问。请严格根据以下法律条文来回答用户的问题。
 
@@ -278,7 +343,6 @@ class HybridLegalRAGPipeline:
         )
         self.answer_chain = legal_prompt | self.llm | StrOutputParser()
 
-        # 拒答
         reject_prompt = ChatPromptTemplate.from_template(
             """用户问了一个与中国劳动法律无关的问题。请礼貌地告诉用户这个系统只能回答劳动法相关的问题，
 并给出1-2个它能回答的问题示例。
@@ -286,11 +350,17 @@ class HybridLegalRAGPipeline:
         )
         self.reject_chain = reject_prompt | self.llm | StrOutputParser()
 
-    # ----------------------------------------------------------------
-    # CRAG
-    # ----------------------------------------------------------------
-
     def _crag_filter(self, question: str, docs: List[Document]) -> List[Document]:
+        if self.crag_mode == "off":
+            self._log("  ⏭️ CRAG 已关闭，保留全部 rerank 结果")
+            return docs
+        if self.crag_mode == "reranker":
+            self._log("  🎯 使用本地 reranker 排序作为 CRAG 结果，跳过 LLM yes/no")
+            return docs
+
+        if self.grade_chain is None:
+            raise RuntimeError("LLM CRAG mode requires grade_chain")
+
         relevant = []
         for i, doc in enumerate(docs):
             score = self.grade_chain.invoke({
@@ -311,7 +381,6 @@ class HybridLegalRAGPipeline:
     # ----------------------------------------------------------------
 
     def query(self, question: str) -> Tuple[str, List[str]]:
-        """RAGAS 评估接口。"""
         result = self.query_with_details(question)
         return result["answer"], result["contexts"]
 
@@ -330,20 +399,21 @@ class HybridLegalRAGPipeline:
             return {
                 "route": route, "answer": answer, "contexts": [],
                 "chunks_retrieved": 0, "chunks_after_filter": 0,
+                "crag_mode": self.crag_mode,
             }
 
-        # Step 2: Hybrid 检索
+        # Step 2: Hybrid + Rerank
         if "咨询" in route:
-            self._log("\n🔍 Step 2 检索策略：Hybrid + RAG-Fusion")
-            raw_docs = self._hybrid_rag_fusion_retrieve(question)
+            self._log("\n🔍 Step 2 检索策略：Hybrid + RAG-Fusion + Rerank")
+            raw_docs = self._hybrid_rag_fusion_then_rerank(question)
         else:
-            self._log("\n🔍 Step 2 检索策略：Hybrid（BM25+向量）")
-            raw_docs = self._hybrid_retrieve(question)
-        self._log(f"  → 检索到 {len(raw_docs)} 个 chunk")
+            self._log("\n🔍 Step 2 检索策略：Hybrid + Rerank")
+            raw_docs = self._hybrid_retrieve_then_rerank(question)
+        self._log(f"  → 重排后保留 {len(raw_docs)} 个 chunk")
 
         # Step 3: CRAG
         self._log("\n🔎 Step 3 CRAG 质检：")
-        filtered_docs = self._crag_filter(question, raw_docs[:6])
+        filtered_docs = self._crag_filter(question, raw_docs)
         self._log(f"  → 质检后保留 {len(filtered_docs)} 个 chunk")
 
         # Step 4: 生成
@@ -355,6 +425,7 @@ class HybridLegalRAGPipeline:
 
         return {
             "route": route,
+            "crag_mode": self.crag_mode,
             "chunks_retrieved": len(raw_docs),
             "chunks_after_filter": len(filtered_docs),
             "answer": answer,
@@ -373,10 +444,9 @@ def _run_demo():
     except ImportError:
         pass
 
-    project_root = Path(__file__).resolve().parent.parent
-    pipeline = HybridLegalRAGPipeline(
-        data_dir=str(project_root / "data"),
-        persist_dir=str(project_root / "chroma_db"),
+    pipeline = HybridRerankLegalRAGPipeline(
+        data_dir=str(settings.data_dir),
+        persist_dir=str(settings.chroma_persist_dir),
         verbose=True,
     )
 
