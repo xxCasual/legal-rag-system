@@ -11,6 +11,12 @@ from app.schemas.documents import (
     DocumentRecord,
     DocumentUploadResponse,
 )
+from app.schemas.law_documents import (
+    LawDocumentListResponse,
+    LawDocumentRecord,
+    LawDocumentUploadResponse,
+    LawIndexRebuildResponse,
+)
 from app.schemas.reviews import (
     PendingReviewListResponse,
     PendingReviewRecord,
@@ -28,6 +34,10 @@ __all__ = [
     "DocumentUploadResponse",
     "ErrorResponse",
     "HealthResponse",
+    "LawDocumentListResponse",
+    "LawDocumentRecord",
+    "LawDocumentUploadResponse",
+    "LawIndexRebuildResponse",
     "PendingReviewListResponse",
     "PendingReviewRecord",
     "ReviewDecisionResponse",

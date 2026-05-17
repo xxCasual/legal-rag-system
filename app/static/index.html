@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>法律 RAG 验收控制台</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>法律 RAG 验收控制台</h1>
+        <p id="lastAction">等待操作</p>
+      </div>
+      <div class="health">
+        <span id="healthDot" class="dot"></span>
+        <span id="healthText">未检查</span>
+        <button id="healthBtn" type="button">健康检查</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel chat-panel">
+        <div class="panel-head">
+          <h2>统一聊天</h2>
+          <button id="clearChatBtn" type="button">清空</button>
+        </div>
+        <div class="quick-actions">
+          <button type="button" data-query="试用期最长多久？">试用期</button>
+          <button type="button" data-query="保险事故发生后，被保险人应如何通知保险人？">保险通知</button>
+          <button type="button" data-query="公司的工资发放日是什么时候？">工资发放日</button>
+          <button type="button" data-query="今天天气怎么样？">拒答</button>
+        </div>
+        <textarea id="chatInput" rows="5" placeholder="输入法律、企业制度或合同审查问题"></textarea>
+        <div class="actions">
+          <button id="sendChatBtn" class="primary" type="button">发送</button>
+        </div>
+        <div id="chatResult" class="result empty">暂无结果</div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>企业制度文档</h2>
+          <button id="refreshCompanyDocsBtn" type="button">刷新</button>
+        </div>
+        <div class="upload-row">
+          <input id="companyFile" type="file" accept=".txt,.md,.pdf,.docx" />
+          <button id="uploadCompanyDocBtn" type="button">上传</button>
+        </div>
+        <div id="companyDocs" class="list empty">暂无文档</div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>法律条文库</h2>
+          <button id="refreshLawDocsBtn" type="button">刷新</button>
+        </div>
+        <div class="upload-row">
+          <input id="lawFile" type="file" accept=".txt" />
+          <button id="uploadLawDocBtn" type="button">上传条文</button>
+        </div>
+        <div class="actions">
+          <button id="rebuildLawIndexBtn" class="warning" type="button">重建法律索引</button>
+        </div>
+        <div id="lawDocs" class="list empty">暂无法律条文</div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>合同审查</h2>
+          <button id="sampleContractBtn" type="button">填入样例</button>
+        </div>
+        <textarea id="contractInput" rows="8" placeholder="粘贴劳动合同文本"></textarea>
+        <div class="actions">
+          <button id="reviewContractBtn" class="primary" type="button">审查合同</button>
+        </div>
+        <div id="contractResult" class="result empty">暂无结果</div>
+      </section>
+
+      <section class="panel approval-panel">
+        <div class="panel-head">
+          <h2>人工审批</h2>
+          <button id="refreshReviewsBtn" type="button">刷新</button>
+        </div>
+        <div id="pendingReviews" class="list empty">暂无待审批记录</div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

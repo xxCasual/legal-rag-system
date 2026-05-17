@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 
 from pydantic import ValidationError
 
@@ -181,6 +182,73 @@ def test_review_api_contracts() -> None:
     assert rejected.final_answer is None
 
 
+def test_law_document_api_contracts() -> None:
+    original_law_document_service = api_main.law_document_service
+
+    class FakeLawDocumentService:
+        def list_documents(self):
+            return [
+                {
+                    "file_name": "law.txt",
+                    "source_type": "txt",
+                    "size_bytes": 12,
+                    "updated_at": "2026-05-17T00:00:00+00:00",
+                    "rebuild_required": False,
+                }
+            ]
+
+        def ingest_upload(self, file_name: str, content: bytes):
+            assert file_name == "new_law.txt"
+            assert content == b"law"
+            return {
+                "file_name": file_name,
+                "source_type": "txt",
+                "size_bytes": len(content),
+                "updated_at": "2026-05-17T00:00:00+00:00",
+                "rebuild_required": True,
+            }
+
+        def rebuild_index(self):
+            return {
+                "message": "法律索引已重建。",
+                "indexed_document_count": 1,
+                "indexed_node_count": 3,
+                "rebuild_required": False,
+            }
+
+    api_main.law_document_service = FakeLawDocumentService()
+    try:
+        listed = asyncio.run(api_main.list_law_documents())
+        uploaded = asyncio.run(
+            api_main.upload_law_document(
+                api_main.UploadFile(filename="new_law.txt", file=__import__("io").BytesIO(b"law"))
+            )
+        )
+        rebuilt = asyncio.run(api_main.rebuild_law_index())
+    finally:
+        api_main.law_document_service = original_law_document_service
+
+    assert listed.documents[0].file_name == "law.txt"
+    assert uploaded.file_name == "new_law.txt"
+    assert uploaded.rebuild_required is True
+    assert rebuilt.indexed_document_count == 1
+    assert rebuilt.indexed_node_count == 3
+
+
+def test_root_serves_frontend() -> None:
+    with TemporaryDirectory() as temp_dir:
+        static_dir = Path(temp_dir)
+        (static_dir / "index.html").write_text("<!doctype html><title>验收控制台</title>", encoding="utf-8")
+        original_static_dir = api_main.STATIC_DIR
+        api_main.STATIC_DIR = static_dir
+        try:
+            response = asyncio.run(api_main.frontend())
+        finally:
+            api_main.STATIC_DIR = original_static_dir
+
+    assert response.path == static_dir / "index.html"
+
+
 if __name__ == "__main__":
     test_health_contract()
     test_chat_contract_without_loading_rag()
@@ -188,4 +256,6 @@ if __name__ == "__main__":
     test_contract_review_contract_without_loading_rag()
     test_contract_review_rejects_blank_text()
     test_review_api_contracts()
+    test_law_document_api_contracts()
+    test_root_serves_frontend()
     print("api contract ok")

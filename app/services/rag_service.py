@@ -31,6 +31,11 @@ class RAGService:
                     )
         return self._pipeline
 
+    def reset_pipeline(self) -> None:
+        """Drop the cached legal RAG pipeline after the law index changes."""
+        with self._lock:
+            self._pipeline = None
+
     def chat(self, query: str) -> Dict[str, Any]:
         started_at = time.perf_counter()
         result = self._get_pipeline().query_with_details(query)
