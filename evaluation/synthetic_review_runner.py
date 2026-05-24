@@ -21,8 +21,8 @@ def load_samples(data_root: str, testset_path: str) -> list[dict[str, Any]]:
         return json.load(handle)
 
 
-def select_samples(samples: list[dict[str, Any]], limit_expression: str) -> list[dict[str, Any]]:
-    """Select samples using a tiny expression language used during local experiments."""
+def slice_samples(samples: list[dict[str, Any]], limit_expression: str) -> list[dict[str, Any]]:
+    """Slice samples using a tiny expression language used during local experiments."""
     limit = eval(limit_expression)
     return samples[:limit]
 
@@ -46,7 +46,7 @@ def main() -> None:
     args = parser.parse_args()
 
     samples = load_samples(args.data_root, args.testset)
-    selected = select_samples(samples, args.limit_expression)
+    selected = slice_samples(samples, args.limit_expression)
     summary = summarize_routes(selected)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
