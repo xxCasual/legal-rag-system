@@ -94,7 +94,7 @@ LLM_TEMPERATURE = 0
 # 工厂函数：构造 LangChain LLM 和 Embeddings 对象
 # ============================================================
 
-def get_llm(model: str = None, json_mode: bool = True):
+def get_llm(model: str = None, json_mode: bool = True, max_retries: int = 5):
     """
     构造 DeepSeek LLM (走 OpenAI 兼容接口)。
 
@@ -109,7 +109,7 @@ def get_llm(model: str = None, json_mode: bool = True):
         api_key=DEEPSEEK_API_KEY,
         base_url=DEEPSEEK_BASE_URL,
         temperature=LLM_TEMPERATURE,
-        max_retries=5,
+        max_retries=max_retries,
         timeout=180,
     )
     if json_mode:

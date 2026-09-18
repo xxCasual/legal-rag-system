@@ -1,7 +1,7 @@
 """
 run_evaluation.py
 ==================
-对一个 RAG 策略跑完整评估，结果保存到 data/results/<strategy>_<timestamp>.csv
+对一个 RAG 策略跑完整评估，结果保存到 data/eval/results/<strategy>_<timestamp>.csv
 
 用法：
     python run_evaluation.py --strategy baseline
@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 import pandas as pd
-from datasets import Dataset
 from tqdm import tqdm
 
 import config
 from rag_adapter import get_rag_system, STRATEGIES
+from diagnostics import METRICS, read_replay_csv, score_samples, summarize
 
 
 # ============================================================
@@ -66,9 +66,10 @@ def run_rag_on_testset(rag_system, samples: List[Dict]) -> List[Dict]:
                 "retrieved_contexts": contexts,
                 "reference": sample["ground_truth"],
                 "synthesizer_name": sample.get("synthesizer_name", "unknown"),
+                "generation_status": "ok",
             })
         except Exception as e:
-            print(f"\n[!] 样本失败: {question[:50]}... ({e})")
+            print(f"\n[!] 样本失败: {question[:50]}... ({type(e).__name__})")
             failed += 1
             # 失败样本占位，避免整体崩溃
             enriched.append({
@@ -77,6 +78,8 @@ def run_rag_on_testset(rag_system, samples: List[Dict]) -> List[Dict]:
                 "retrieved_contexts": [""],
                 "reference": sample["ground_truth"],
                 "synthesizer_name": sample.get("synthesizer_name", "unknown"),
+                "generation_status": "error",
+                "generation_error_type": type(e).__name__,
             })
 
     if failed:
@@ -88,64 +91,41 @@ def run_rag_on_testset(rag_system, samples: List[Dict]) -> List[Dict]:
 # Step 3: 用 RAGAS 评估四个指标
 # ============================================================
 
-def evaluate_with_ragas(enriched_samples: List[Dict]) -> pd.DataFrame:
-    """
-    跑 RAGAS 评估。返回每个样本的指标分数 + 元数据。
-    """
+def evaluate_with_ragas(enriched_samples: List[Dict], *, metrics=None, attempts=1, audit_path=None) -> pd.DataFrame:
+    """Score one sample/metric at a time; retain all failures in a JSONL ledger."""
     from ragas import evaluate, EvaluationDataset
-    from ragas.metrics import (
-        Faithfulness,
-        ResponseRelevancy,        # 旧名 AnswerRelevancy
-        LLMContextPrecisionWithReference,  # 旧名 ContextPrecision
-        LLMContextRecall,          # 旧名 ContextRecall
-    )
+    from ragas.metrics import Faithfulness, ResponseRelevancy, LLMContextPrecisionWithReference, LLMContextRecall
     from ragas.llms import LangchainLLMWrapper
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from ragas.run_config import RunConfig
 
-    print(f"\n>>> 配置 RAGAS 评估器...")
-    print(f"    LLM: {config.EVALUATOR_LLM_MODEL} (DeepSeek)")
+    selected = list(dict.fromkeys(metrics or METRICS))
+    unknown = set(selected) - set(METRICS)
+    if unknown:
+        raise ValueError(f"Unknown metrics: {sorted(unknown)}")
+    llm = None
+    embeddings = None
+    factories = {"faithfulness": Faithfulness, "answer_relevancy": ResponseRelevancy,
+                 "llm_context_precision_with_reference": LLMContextPrecisionWithReference, "context_recall": LLMContextRecall}
+    instances = {}
 
-    evaluator_llm = LangchainLLMWrapper(
-        config.get_llm(model=config.EVALUATOR_LLM_MODEL)
-    )
-    evaluator_embeddings = LangchainEmbeddingsWrapper(
-        config.get_embeddings()
-    )
+    def scorer(sample, metric, attempt):
+        nonlocal llm, embeddings
+        # Initialization is inside the audited boundary, including embedding failures.
+        if llm is None:
+            llm = LangchainLLMWrapper(config.get_llm(model=config.EVALUATOR_LLM_MODEL, max_retries=0))
+        if metric == "answer_relevancy" and embeddings is None:
+            embeddings = LangchainEmbeddingsWrapper(config.get_embeddings())
+        if metric not in instances:
+            instances[metric] = factories[metric](llm=llm, **({"embeddings": embeddings} if metric == "answer_relevancy" else {}))
+        data = {k: sample[k] for k in ("user_input", "response", "retrieved_contexts", "reference")}
+        result = evaluate(dataset=EvaluationDataset.from_list([data]), metrics=[instances[metric]],
+                          llm=llm, embeddings=embeddings, run_config=RunConfig(max_workers=1, timeout=180, max_retries=1),
+                          show_progress=False, raise_exceptions=True)
+        return result.to_pandas().iloc[0][instances[metric].name]
 
-    # 构造 RAGAS 数据集
-    eval_dataset = EvaluationDataset.from_list(enriched_samples)
-
-    # 四个核心指标
-    metrics = [
-        Faithfulness(llm=evaluator_llm),
-        ResponseRelevancy(
-            llm=evaluator_llm, embeddings=evaluator_embeddings
-        ),
-        LLMContextPrecisionWithReference(llm=evaluator_llm),
-        LLMContextRecall(llm=evaluator_llm),
-    ]
-
-    print(f">>> 开始评估（4 个指标 × {len(enriched_samples)} 样本）...")
-    print(f"    预计耗时 10-25 分钟")
-
-    run_config = RunConfig(
-        max_workers=config.MAX_CONCURRENT,
-        timeout=180,
-        max_retries=3,
-    )
-
-    result = evaluate(
-        dataset=eval_dataset,
-        metrics=metrics,
-        llm=evaluator_llm,
-        embeddings=evaluator_embeddings,
-        run_config=run_config,
-        show_progress=True,
-    )
-
-    df = result.to_pandas()
-    return df
+    audit_path = audit_path or config.RESULTS_DIR / ("attempts_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jsonl")
+    return pd.DataFrame(score_samples(enriched_samples, selected, scorer, attempts=attempts, audit_path=audit_path))
 
 
 # ============================================================
@@ -153,7 +133,7 @@ def evaluate_with_ragas(enriched_samples: List[Dict]) -> pd.DataFrame:
 # ============================================================
 
 def save_results(df: pd.DataFrame, strategy_name: str, tag: str = None):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     suffix = f"_{tag}" if tag else ""
     filename = f"{strategy_name}{suffix}_{timestamp}.csv"
     path = config.RESULTS_DIR / filename
@@ -164,55 +144,15 @@ def save_results(df: pd.DataFrame, strategy_name: str, tag: str = None):
 
 
 def print_summary(df: pd.DataFrame, strategy_name: str):
-    """打印四个指标的均值，作为本次评估的"基线分数"。"""
-    print("\n" + "=" * 70)
-    print(f"评估总结 - 策略: {strategy_name}")
-    print("=" * 70)
-
-    metric_cols = [
-        "faithfulness",
-        "answer_relevancy",
-        "llm_context_precision_with_reference",
-        "context_recall",
-    ]
-    # RAGAS 列名跨版本可能略有不同，做兜底
-    name_map = {
-        "faithfulness": "Faithfulness (无幻觉)",
-        "answer_relevancy": "Answer Relevancy (切题)",
-        "llm_context_precision_with_reference": "Context Precision (检索精准度)",
-        "context_precision": "Context Precision (检索精准度)",
-        "context_recall": "Context Recall (检索召回)",
-    }
-
-    print(f"\n{'指标':<35} {'均值':>10} {'中位数':>10} {'标准差':>10}")
-    print("-" * 70)
-    for col in df.columns:
-        if col in name_map:
-            try:
-                vals = df[col].dropna().astype(float)
-                if len(vals) == 0:
-                    continue
-                print(
-                    f"{name_map[col]:<35} "
-                    f"{vals.mean():>10.4f} "
-                    f"{vals.median():>10.4f} "
-                    f"{vals.std():>10.4f}"
-                )
-            except Exception:
-                pass
-
-    # 按问题类型分组的均值（如果有 synthesizer_name 列）
-    if "synthesizer_name" in df.columns:
-        print(f"\n按问题类型分组的均值:")
-        print("-" * 70)
-        metric_cols_present = [
-            c for c in metric_cols if c in df.columns
-        ]
-        if metric_cols_present:
-            grouped = df.groupby("synthesizer_name")[metric_cols_present].mean()
-            print(grouped.round(4).to_string())
-
-    print("=" * 70)
+    """Always display denominator and missingness; no aggregate of unlike denominators."""
+    print(f"\n评估总结 - {strategy_name}")
+    print("指标 | 有效/总数 | 缺失率 | 均值 | 标准差（题间，非重复稳定性）")
+    metrics = [name for name in METRICS if name in df.columns]
+    for metric, stat in summarize(df.to_dict("records"), metrics).items():
+        mean = f"{stat['mean']:.4f}" if stat['mean'] is not None else "N/A"
+        std = f"{stat['sample_std']:.4f}" if stat['sample_std'] is not None else "N/A"
+        missing = f"{stat['missing_rate']:.1%}" if stat['missing_rate'] is not None else "N/A"
+        print(f"{metric} | {stat['valid']}/{stat['total']} | {missing} | {mean} | {std}")
 
 
 # ============================================================
@@ -224,8 +164,8 @@ def main():
     parser.add_argument(
         "--strategy",
         choices=list(STRATEGIES.keys()),
-        required=True,
-        help="要评估的 RAG 策略",
+        default="baseline",
+        help="要评估的 RAG 策略（回放时不生成新答案）",
     )
     parser.add_argument(
         "--limit", type=int, default=None,
@@ -235,27 +175,46 @@ def main():
         "--tag", type=str, default=None,
         help="给结果文件加自定义标签",
     )
+    parser.add_argument("--replay-csv", type=Path, help="复用已保存的回答和上下文，仅重新评分")
+    parser.add_argument("--out-dir", type=Path, help="独立结果目录，不覆盖历史 CSV")
+    parser.add_argument("--metric", choices=METRICS, action="append", help="只评分指定指标，可重复")
+    parser.add_argument("--attempts", type=int, default=1, help="每项最大尝试次数，默认不额外重试")
     args = parser.parse_args()
+    if args.limit is not None and args.limit <= 0: parser.error("--limit must be positive")
+    if args.attempts <= 0: parser.error("--attempts must be positive")
+    if args.out_dir:
+        config.RESULTS_DIR = args.out_dir
+        config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     if not config.DEEPSEEK_API_KEY:
         print("[错误] 未设置 DEEPSEEK_API_KEY")
         sys.exit(1)
 
-    # 1. 加载测试集
-    samples = load_testset()
-    if args.limit:
-        samples = samples[: args.limit]
-        print(f">>> 限制为前 {args.limit} 个样本（调试模式）")
+    if args.replay_csv:
+        enriched = read_replay_csv(args.replay_csv)
+        if args.limit: enriched = enriched[:args.limit]
+    else:
+        samples = load_testset()
+        if args.limit: samples = samples[:args.limit]
+        rag = get_rag_system(args.strategy)
+        enriched = run_rag_on_testset(rag, samples)
 
-    # 2. 实例化 RAG 系统
-    print(f"\n>>> 实例化策略: {args.strategy}")
-    rag = get_rag_system(args.strategy)
-
-    # 3. 跑 RAG（生成 answer + contexts）
-    enriched = run_rag_on_testset(rag, samples)
-
-    # 4. RAGAS 评估
-    df = evaluate_with_ragas(enriched)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    audit = config.RESULTS_DIR / f"attempts_{stamp}.jsonl"
+    # Preserve inputs even if model/embedding setup fails.
+    (config.RESULTS_DIR / f"inputs_{stamp}.json").write_text(json.dumps(enriched, ensure_ascii=False, indent=2), encoding="utf-8")
+    import hashlib
+    import importlib.metadata
+    import platform
+    meta = {"python": platform.python_version(), "strategy": args.strategy, "replay": str(args.replay_csv) if args.replay_csv else None,
+            "model": config.EVALUATOR_LLM_MODEL, "metrics": args.metric or list(METRICS), "attempts": args.attempts,
+            "packages": {name: importlib.metadata.version(name) for name in ("ragas", "langchain-openai", "pandas")},
+            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "replay_sha256": hashlib.sha256(args.replay_csv.read_bytes()).hexdigest() if args.replay_csv else None,
+            "audit": str(audit), "mode": "saved_answer_rescore" if args.replay_csv else "fresh_generation"}
+    (config.RESULTS_DIR / f"manifest_{stamp}.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    df = evaluate_with_ragas(enriched, metrics=args.metric, attempts=args.attempts, audit_path=audit)
+    (config.RESULTS_DIR / f"summary_{stamp}.json").write_text(json.dumps(summarize(df.to_dict("records"), args.metric or METRICS), ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
     # 5. 保存 + 总结
     path = save_results(df, args.strategy, tag=args.tag)
