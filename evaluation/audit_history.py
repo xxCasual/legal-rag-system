@@ -1,5 +1,6 @@
 """Recompute historical coverage and the paired recall comparison without API calls."""
 import argparse
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -32,6 +33,15 @@ def main():
         pair=dict(left=a,right=b,n=n,mean_left=sum(float(r['context_recall']) for r in left.values())/n,
                   mean_right=sum(float(r['context_recall']) for r in right.values())/n,mean_difference=sum(diffs)/n,
                   improved=sum(v>0 for v in diffs),unchanged=sum(v==0 for v in diffs),worsened=sum(v<0 for v in diffs))
+        with open(args.out/'paired-results.csv','w',newline='',encoding='utf-8') as f:
+            w=csv.writer(f);w.writerow(['sample_id','user_input','reference','context_recall_rerank_base','context_recall_rerank_v2_m3','difference'])
+            for r in loaded[a]:
+                k=sample_id(r);l=float(r['context_recall']);m=float(right[k]['context_recall'])
+                w.writerow([k,r['user_input'],r['reference'],l,m,m-l])
+    with open(args.out/'summary.csv','w',newline='',encoding='utf-8') as f:
+        w=csv.writer(f);w.writerow(['file','metric','total','valid','missing','mean'])
+        for name,record in data.items():
+            for metric,stats in record['metrics'].items(): w.writerow([name,metric,stats['total'],stats['valid'],stats['missing'],stats['mean']])
     (args.out/'rag-history.json').write_text(json.dumps(dict(files=data,paired_recall=pair),ensure_ascii=False,indent=2,allow_nan=False))
     lines=['# RAG 历史数据复算','', '本报告只重算保存的 CSV；未重新检索、生成或调用模型。历史错误原因未被保存，缺失统一标注 historical_missing_unknown。','', '| 文件 | 指标 | 有效/总数 | 缺失率 | 均值 |','| --- | --- | --- | --- | --- |']
     for name,record in data.items():

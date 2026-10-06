@@ -1,26 +1,28 @@
 # Legal RAG System｜中国劳动法律 RAG 检索问答系统
 
-> 基于 4 部中国劳动法律的 RAG 系统，融合 **路由 + Hybrid 检索 + Reranker + CRAG 质检**，使用 **RAGAS** 框架进行五阶段量化评估，整体性能相对 baseline **提升 25.8%**。
+> 基于 4 部中国劳动法律的 RAG 原型，融合 **路由 + Hybrid 检索 + Reranker + CRAG 质检**，使用 **RAGAS** 对检索链路做了五个版本的评测。
+>
+> 这是 LangChain 原型，已重构为 [Enterprise_Legal_RAG_Agent](https://github.com/xxCasual/Enterprise_Legal_RAG_Agent)（LlamaIndex + LangGraph）。下列 RAGAS 结果只属于本原型，不代表重构版效果。
 
 ## 评估结果
 
-![五阶段演进对比](data/eval/results/comparison_20260502_164743.png)
+公开证据、逐题配对结果与复算命令见 [evaluation/published-results/](evaluation/published-results/)。表中均值只对有效分数求平均，括号内为有效数 / 记录数。
 
-| 版本 | 主要改动 | Faithfulness | Answer Relevancy | Context Precision | Context Recall | **平均** |
-|---|---|---|---|---|---|---|
-| v1 baseline | 路由 + 向量检索 + RAG-Fusion + CRAG | 0.754 | 0.689 | 0.613 | 0.684 | **0.685** |
-| v2 修路由+清洗 | 修复路由 prompt + 清洗测试集 | 0.840 | 0.799 | 0.658 | 0.772 | **0.767** |
-| v3 +hybrid | BM25 + 向量 + RRF 融合检索 | 0.829 | 0.768 | 0.797 | 0.894 | **0.822** |
-| ❌ v4 +rerank-base | 加入 BGE-reranker-base | 0.804 | 0.566 | 0.795 | 0.828 | 0.748（**回退**）|
-| ⭐ **v5 +rerank-m3** | **升级到 BGE-reranker-v2-m3** | **0.851** | **0.931** | 0.777 | 0.889 | **0.862** |
+| 版本 | 主要改动 | Faithfulness | Answer Relevancy | Context Precision | Context Recall |
+|---|---|---|---|---|---|
+| v1 baseline | 路由 + 向量检索 + RAG-Fusion + CRAG | 0.754（45/54） | 0.689（4/54） | 0.613（53/54） | 0.684（54/54） |
+| v2 修路由+清洗 | 修复路由 prompt + 清洗测试集 | 0.840（39/50） | 0.799（2/50） | 0.658（46/50） | 0.772（50/50） |
+| v3 +hybrid | BM25 + 向量 + RRF 融合检索 | 0.829（35/48） | 0.768（6/48） | 0.797（48/48） | 0.894（45/48） |
+| v4 +rerank-base | 加入 BGE-reranker-base | 0.804（36/48） | 0.566（6/48） | 0.795（44/48） | 0.828（48/48） |
+| v5 +rerank-m3 | 升级到 BGE-reranker-v2-m3 | 0.851（44/48） | 0.931（3/48） | 0.777（46/48） | 0.889（48/48） |
 
-**最终版本 (v5) 相对 baseline 的提升**：
-- Faithfulness：0.754 → 0.851（**+12.9%**），无幻觉答案占比大幅提升
-- Answer Relevancy：0.689 → 0.931（**+35.1%**），标准差从 0.46 收敛到 0.05，稳定性接近天花板
-- Context Precision：0.613 → 0.777（**+26.7%**）
-- Context Recall：0.684 → 0.889（**+30.0%**）
+读数时注意：
 
-测试集：50 个问题（RAGAS TestsetGenerator 生成 + 人工质检）｜评估器：DeepSeek-V4 + BGE 中文 embedding
+- 测试集在迭代中清洗过，各版本记录数为 54 / 50 / 48 / 48 / 48，不同版本之间不是同一批样本，因此不计算四项平均分或相对 baseline 的提升百分比。
+- Answer Relevancy 每组只有 2–6 个有效分数，不能据此判断效果或稳定性。
+- 唯一同题对比是 v4 与 v5：48 条问题与参考答案逐条一致，Context Recall 0.828 → 0.889（提高 6、不变 41、降低 1）。两版的候选池大小也不同，且当时未冻结全部依赖与环境，不能单独归因于重排模型。
+
+测试集：由 RAGAS TestsetGenerator 生成并人工清洗｜评估器：DeepSeek API `deepseek-chat`（当天别名对应的版本未记录）+ `BAAI/bge-large-zh-v1.5`｜RAGAS 版本未冻结
 
 ---
 
@@ -81,6 +83,8 @@
 ## 五阶段优化历程：数据驱动调优实录
 
 这个项目最有价值的部分不是最终的架构，而是**到达那里的过程**。每一步都基于 RAGAS 评估数据做诊断和决策。
+
+> 以下阶段记录写于 2026-05-02，括号中的分数与百分比是四项指标的平均，而各指标、各版本的有效分母不同；文中的 Answer Relevancy 标准差也只来自 2–6 个有效值。保留作开发过程记录，结论以上方表格和 [published-results](evaluation/published-results/) 为准。
 
 ### Stage 1: Baseline (0.685)
 
@@ -238,7 +242,7 @@ python evaluation/visualize_results.py
 
 ## 已知局限
 
-- **测试集规模**：50 个样本统计意义有限，正式部署前应扩展到 200+。
+- **测试集规模**：48–54 个样本，且在迭代中反复使用，属于回归集而非留出集；统计意义有限，正式部署前应扩展到 200+ 并另留测试集。
 - **跨法律对比类问题**：剩余崩盘集中在"同时引用《保险法》和《劳动法》"的对比型题目，需要在 multi-query 改写时强制覆盖多个法律领域，这是下一阶段优化方向。
 - **未做长对话支持**：当前是单轮 RAG，多轮对话需要加 query rewriting 机制。
 
